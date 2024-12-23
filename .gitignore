@@ -184,3 +184,6 @@ bin/
 
 # whl files
 *.whl
+
+# jupyter notebook files
+main.ipynb
