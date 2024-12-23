@@ -162,3 +162,25 @@ generated_code.txt
 generated_code.py
 
 saved_files/
+
+# virtual environment. venv and its contents
+venv/
+.venv/
+
+
+# pyenv
+.python-version
+# config files
+pyvenv.cfg
+
+# poetry
+.venv/
+
+# any file with .env in the name
+*.env
+
+# bin and its contents
+bin/
+
+# whl files
+*.whl
