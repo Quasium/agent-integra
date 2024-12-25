@@ -1,9 +1,9 @@
-from typing import Optional, Tuple, Dict, Any, Union
+from typing import Optional, Tuple, Dict, Any, Union, List, Set
 import requests
 import re
 import yaml
 import json
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass
 from bs4 import BeautifulSoup
 
@@ -15,6 +15,13 @@ from playwright.sync_api._generated import Page, Browser
 class DocTypeResult:
     doc_type: str
     confidence: float
+
+@dataclass 
+class DocPage:
+    url: str
+    title: str
+    content: str
+    spec: Optional[Dict[str, Any]] = None
 
 def detect_documentation_type(html_content: str) -> DocTypeResult:
     """
@@ -56,6 +63,43 @@ def detect_documentation_type(html_content: str) -> DocTypeResult:
 
     return DocTypeResult("unknown", 0.0)
 
+def extract_doc_links(html_content: str, base_url: str) -> Set[str]:
+    """
+    Extract all documentation page links from HTML content.
+    
+    Args:
+        html_content: Raw HTML content to search
+        base_url: Base URL to resolve relative URLs
+        
+    Returns:
+        Set[str]: Set of absolute URLs for documentation pages
+    """
+    if not html_content or not base_url:
+        return set()
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+    links = set()
+    base_domain = urlparse(base_url).netloc
+
+    # Common documentation navigation elements
+    nav_elements = soup.find_all(['nav', 'div'], class_=re.compile(r'nav|menu|sidebar|toc', re.IGNORECASE))
+    
+    for nav in nav_elements:
+        for a in nav.find_all('a', href=True):
+            url = urljoin(base_url, a['href'])
+            if urlparse(url).netloc == base_domain:
+                links.add(url)
+
+    # Also look for links in main content area
+    main_content = soup.find(['main', 'article', 'div'], 
+                           class_=re.compile(r'content|main|documentation', re.IGNORECASE))
+    if main_content:
+        for a in main_content.find_all('a', href=True):
+            url = urljoin(base_url, a['href'])
+            if urlparse(url).netloc == base_domain:
+                links.add(url)
+
+    return links
 
 def find_spec_link(html_content: str, base_url: str) -> Optional[str]:
     """
@@ -95,7 +139,6 @@ def find_spec_link(html_content: str, base_url: str) -> Optional[str]:
     match = re.search(combined_pattern, html_content, re.IGNORECASE)
     return match.group(0) if match else None
 
-
 def retrieve_api_spec(spec_url: str) -> Optional[str]:
     """
     Download the spec file from the given URL.
@@ -116,7 +159,6 @@ def retrieve_api_spec(spec_url: str) -> Optional[str]:
     except (requests.RequestException, Exception) as e:
         print(f"Failed to retrieve spec from {spec_url}: {e}")
         return None
-
 
 def parse_api_spec(spec_text: Optional[str]) -> Optional[Dict[str, Any]]:
     """
@@ -145,7 +187,6 @@ def parse_api_spec(spec_text: Optional[str]) -> Optional[Dict[str, Any]]:
 
     return None
 
-
 def reconstruct_definition(spec_dict: Optional[Dict[str, Any]], doc_type: str) -> Optional[str]:
     """
     Convert spec dictionary to canonical JSON format.
@@ -165,7 +206,6 @@ def reconstruct_definition(spec_dict: Optional[Dict[str, Any]], doc_type: str) -
     except (TypeError, ValueError) as e:
         print(f"Failed to serialize spec: {e}")
         return None
-
 
 def fetch_html_dynamic(url: str) -> Optional[str]:
     """
@@ -190,7 +230,6 @@ def fetch_html_dynamic(url: str) -> Optional[str]:
     finally:
         if browser:
             browser.close()
-
 
 def fetch_documentation_html(url: str, use_playwright: bool = False) -> Optional[str]:
     """
@@ -221,59 +260,90 @@ def fetch_documentation_html(url: str, use_playwright: bool = False) -> Optional
 
     return None
 
-
-def parse_api_documentation(url: str, use_playwright: bool = False) -> Tuple[Optional[str], Optional[str]]:
+def parse_doc_page(url: str, html_content: str) -> DocPage:
     """
-    Main function to parse API documentation.
+    Parse a single documentation page.
     
     Args:
-        url: Documentation URL
+        url: Page URL
+        html_content: HTML content
+        
+    Returns:
+        DocPage: Parsed page information
+    """
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Try to find title
+    title = ""
+    title_elem = soup.find(['h1', 'title'])
+    if title_elem:
+        title = title_elem.get_text(strip=True)
+    
+    # Try to find main content
+    content = ""
+    main_content = soup.find(['main', 'article', 'div'], 
+                           class_=re.compile(r'content|main|documentation', re.IGNORECASE))
+    if main_content:
+        content = main_content.get_text(strip=True)
+    
+    # Look for API spec
+    spec_url = find_spec_link(html_content, url)
+    spec = None
+    if spec_url:
+        spec_text = retrieve_api_spec(spec_url)
+        if spec_text:
+            spec = parse_api_spec(spec_text)
+            
+    return DocPage(url=url, title=title, content=content, spec=spec)
+
+def parse_api_documentation(url: str, use_playwright: bool = False) -> List[DocPage]:
+    """
+    Main function to parse API documentation by crawling all pages.
+    
+    Args:
+        url: Documentation homepage URL
         use_playwright: Whether to try Playwright for dynamic content
         
     Returns:
-        Tuple[Optional[str], Optional[str]]: (doc_type, reconstructed_spec)
+        List[DocPage]: List of parsed documentation pages
     """
     if not url:
-        return None, None
+        return []
 
-    html_content = fetch_documentation_html(url, use_playwright)
-    if not html_content:
-        print("Could not fetch HTML content")
-        return None, None
+    visited_urls = set()
+    pages_to_visit = {url}
+    parsed_pages = []
 
-    # Detect documentation type
-    doc_result = detect_documentation_type(html_content)
-    print(f"Detected documentation type: {doc_result.doc_type} (confidence: {doc_result.confidence:.2f})")
+    while pages_to_visit:
+        current_url = pages_to_visit.pop()
+        if current_url in visited_urls:
+            continue
+            
+        visited_urls.add(current_url)
+        print(f"Processing page: {current_url}")
 
-    # Find and fetch spec
-    spec_url = find_spec_link(html_content, url)
-    if not spec_url:
-        print("No spec link found")
-        if not use_playwright:
-            print("Retrying with Playwright...")
-            return parse_api_documentation(url, use_playwright=True)
-        return doc_result.doc_type, None
+        html_content = fetch_documentation_html(current_url, use_playwright)
+        if not html_content:
+            print(f"Could not fetch HTML content for {current_url}")
+            continue
 
-    print(f"Found spec link: {spec_url}")
-    
-    spec_text = retrieve_api_spec(spec_url)
-    if not spec_text:
-        return doc_result.doc_type, None
+        # Parse current page
+        doc_page = parse_doc_page(current_url, html_content)
+        parsed_pages.append(doc_page)
 
-    spec_dict = parse_api_spec(spec_text)
-    if not spec_dict:
-        return doc_result.doc_type, None
+        # Extract links to other documentation pages
+        new_links = extract_doc_links(html_content, current_url)
+        pages_to_visit.update(new_links - visited_urls)
 
-    final_definition = reconstruct_definition(spec_dict, doc_result.doc_type)
-    return doc_result.doc_type, final_definition
-
+    return parsed_pages
 
 if __name__ == "__main__":
     test_url = "https://petstore.swagger.io/"
-    doc_type, spec = parse_api_documentation(test_url, use_playwright=True)
+    doc_pages = parse_api_documentation(test_url, use_playwright=True)
 
-    if doc_type and spec:
-        print("\n=== Reconstructed API Definition ===")
-        print(spec)
-    else:
-        print("\nCould not reconstruct the API definition.")
+    print(f"\nFound {len(doc_pages)} documentation pages:")
+    for page in doc_pages:
+        print(f"\nPage: {page.url}")
+        print(f"Title: {page.title}")
+        if page.spec:
+            print("Found API specification")
