@@ -63,6 +63,9 @@ Let's assume we want to download utility bills:
    poetry run integuru --prompt "download utility bills" --model <gpt-4o|o1-preview|o1-mini|o1>
    ```
    You can also run it via Jupyter Notebook `main.ipynb`
+   ```
+   poetry run jupyter notebook main.ipynb  
+   ```
 
    **Recommended to use gpt-4o as the model for graph generation as it supports function calling. Integuru will automatically switch to o1-preview for code generation if available in the user's OpenAI account.** 
 
