@@ -1,124 +1,143 @@
+from typing import Optional, Tuple, Dict, Any, Union
 import requests
 import re
 import yaml
 import json
 from urllib.parse import urljoin
-
+from dataclasses import dataclass
 from bs4 import BeautifulSoup
 
 # Playwright for handling complex JS-driven pages
 from playwright.sync_api import sync_playwright
+from playwright.sync_api._generated import Page, Browser
 
-def detect_documentation_type(html_content):
+@dataclass
+class DocTypeResult:
+    doc_type: str
+    confidence: float
+
+def detect_documentation_type(html_content: str) -> DocTypeResult:
     """
     Detect whether the given HTML content is from:
       - OpenAPI/Swagger
       - Postman
       - Unknown/Other
 
-    Returns: "openapi", "swagger", "postman", or "unknown"
+    Returns: DocTypeResult with doc_type and confidence score
     """
+    if not html_content:
+        return DocTypeResult("unknown", 0.0)
+
     soup = BeautifulSoup(html_content, 'html.parser')
+    confidence = 0.0
 
     # 1. Look for Swagger / OpenAPI references
-    # Check for scripts or links referencing swagger-ui or ReDoc
     swagger_ui = soup.find('script', src=re.compile(r'swagger-ui', re.IGNORECASE))
     redoc = soup.find('script', src=re.compile(r'redoc', re.IGNORECASE))
     if swagger_ui or redoc:
-        # Strong indicator of OpenAPI/Swagger-based docs
-        return "openapi"
+        confidence = 0.9
+        return DocTypeResult("openapi", confidence)
 
-    # Check for a div with swagger UI
     swagger_div = soup.find(id='swagger-ui')
     if swagger_div:
-        return "swagger"
+        confidence = 0.8
+        return DocTypeResult("swagger", confidence)
 
     # 2. Look for Postman references
     postman_link = soup.find('a', href=re.compile(r'getpostman|documenter\.getpostman\.com', re.IGNORECASE))
     if postman_link:
-        return "postman"
+        confidence = 0.7
+        return DocTypeResult("postman", confidence)
 
-    # Look for a "Run in Postman" button
     run_in_postman = soup.find('img', alt=re.compile(r'Run in Postman', re.IGNORECASE))
     if run_in_postman:
-        return "postman"
+        confidence = 0.6
+        return DocTypeResult("postman", confidence)
 
-    # If not found anything relevant
-    return "unknown"
+    return DocTypeResult("unknown", 0.0)
 
 
-def find_spec_link(html_content, base_url):
+def find_spec_link(html_content: str, base_url: str) -> Optional[str]:
     """
-    Attempt to find a direct link to the underlying API spec file
-    (e.g., swagger.json, openapi.yaml, postman_collection.json).
-    Returns the absolute URL of the spec or None if not found.
+    Attempt to find a direct link to the underlying API spec file.
+    
+    Args:
+        html_content: Raw HTML content to search
+        base_url: Base URL to resolve relative URLs
+        
+    Returns:
+        Optional[str]: Absolute URL of the spec if found, None otherwise
     """
+    if not html_content or not base_url:
+        return None
+
     soup = BeautifulSoup(html_content, 'html.parser')
-
-    # 1. Look for script/link tags referencing swagger.json, openapi.* or postman_collection.json
-    script_tags = soup.find_all('script', src=True)
-    link_tags = soup.find_all('link', href=True)
-    anchor_tags = soup.find_all('a', href=True)
 
     patterns = [
         r'swagger\.json',
         r'openapi\.json',
-        r'openapi\.yaml',
-        r'openapi\.yml',
+        r'openapi\.ya?ml',
         r'postman_collection\.json'
     ]
 
-    for pattern in patterns:
-        # Check script src
-        for tag in script_tags:
-            src = tag.get('src', '')
-            if re.search(pattern, src, re.IGNORECASE):
-                return urljoin(base_url, src)
-        # Check link href
-        for tag in link_tags:
-            href = tag.get('href', '')
-            if re.search(pattern, href, re.IGNORECASE):
-                return urljoin(base_url, href)
-        # Check anchor href
-        for tag in anchor_tags:
-            href = tag.get('href', '')
-            if re.search(pattern, href, re.IGNORECASE):
-                return urljoin(base_url, href)
+    # Search in script, link and anchor tags
+    for tag_type, attr in [('script', 'src'), ('link', 'href'), ('a', 'href')]:
+        for tag in soup.find_all(tag_type, {attr: True}):
+            url = tag.get(attr, '')
+            if any(re.search(pattern, url, re.IGNORECASE) for pattern in patterns):
+                try:
+                    return urljoin(base_url, url)
+                except Exception:
+                    continue
 
-    # 2. Search entire HTML for direct references (fallback)
-    combined_pattern = r'https?://[^"\'<>\s]+(?:swagger\.json|openapi\.(?:json|yaml|yml)|postman_collection\.json)'
+    # Fallback: Search entire HTML
+    combined_pattern = r'https?://[^"\'<>\s]+(?:swagger\.json|openapi\.(?:json|ya?ml)|postman_collection\.json)'
     match = re.search(combined_pattern, html_content, re.IGNORECASE)
-    if match:
-        return match.group(0)
-
-    return None
+    return match.group(0) if match else None
 
 
-def retrieve_api_spec(spec_url):
+def retrieve_api_spec(spec_url: str) -> Optional[str]:
     """
     Download the spec file from the given URL.
-    Returns the raw text of the spec or None if there's an error.
+    
+    Args:
+        spec_url: URL to fetch the spec from
+        
+    Returns:
+        Optional[str]: Raw text of the spec if successful, None otherwise
     """
+    if not spec_url:
+        return None
+        
     try:
         resp = requests.get(spec_url, timeout=10)
         resp.raise_for_status()
         return resp.text
-    except Exception as e:
+    except (requests.RequestException, Exception) as e:
         print(f"Failed to retrieve spec from {spec_url}: {e}")
         return None
 
 
-def parse_api_spec(spec_text):
+def parse_api_spec(spec_text: Optional[str]) -> Optional[Dict[str, Any]]:
     """
-    Parse the spec text as JSON or YAML and return a Python dictionary.
+    Parse the spec text as JSON or YAML.
+    
+    Args:
+        spec_text: Raw text to parse
+        
+    Returns:
+        Optional[Dict]: Parsed spec as dictionary if successful, None otherwise
     """
-    # Try JSON
+    if not spec_text:
+        return None
+
+    # Try JSON first
     try:
         return json.loads(spec_text)
     except json.JSONDecodeError:
         pass
 
-    # Try YAML
+    # Try YAML as fallback
     try:
         return yaml.safe_load(spec_text)
     except yaml.YAMLError:
@@ -127,119 +146,130 @@ def parse_api_spec(spec_text):
     return None
 
 
-def reconstruct_definition(spec_dict, doc_type):
+def reconstruct_definition(spec_dict: Optional[Dict[str, Any]], doc_type: str) -> Optional[str]:
     """
-    Based on doc_type ("openapi", "swagger", "postman"),
-    returns the canonical JSON format of the specification.
-
-    In real usage, you might refine or validate the structure further.
+    Convert spec dictionary to canonical JSON format.
+    
+    Args:
+        spec_dict: Parsed spec dictionary
+        doc_type: Type of documentation ("openapi", "swagger", "postman")
+        
+    Returns:
+        Optional[str]: JSON string if successful, None otherwise
     """
     if not spec_dict:
         return None
 
-    # For demonstration, we simply return the JSON-serialized version
-    # of the specification dictionary.
-    return json.dumps(spec_dict, indent=2)
-
-
-def fetch_html_dynamic(url):
-    """
-    Fetch the fully rendered HTML content of a URL using Playwright
-    for pages that require JavaScript to load API spec references.
-    """
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until='networkidle')  # Wait for network requests to finish
-            html_content = page.content()
-            browser.close()
-        return html_content
-    except Exception as e:
-        print(f"Playwright error when fetching {url}: {e}")
+        return json.dumps(spec_dict, indent=2)
+    except (TypeError, ValueError) as e:
+        print(f"Failed to serialize spec: {e}")
         return None
 
 
-def fetch_documentation_html(url, use_playwright=False):
+def fetch_html_dynamic(url: str) -> Optional[str]:
     """
-    Attempt to fetch HTML from a URL using:
-      1. requests (fast, but static)
-      2. fallback to Playwright if use_playwright=True or requests fails
+    Fetch rendered HTML using Playwright.
+    
+    Args:
+        url: URL to fetch
+        
+    Returns:
+        Optional[str]: Rendered HTML if successful, None otherwise
+    """
+    browser: Optional[Browser] = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page: Page = browser.new_page()
+            page.goto(url, wait_until='networkidle', timeout=30000)
+            return page.content()
+    except Exception as e:
+        print(f"Playwright error when fetching {url}: {e}")
+        return None
+    finally:
+        if browser:
+            browser.close()
 
-    Returns the HTML string or None.
+
+def fetch_documentation_html(url: str, use_playwright: bool = False) -> Optional[str]:
     """
-    # First attempt with requests (static approach)
+    Fetch HTML using requests or Playwright.
+    
+    Args:
+        url: URL to fetch
+        use_playwright: Whether to try Playwright if requests fails
+        
+    Returns:
+        Optional[str]: HTML content if successful, None otherwise
+    """
+    if not url:
+        return None
+
+    # Try requests first
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        # Check if there's enough content (very naive check)
         if len(resp.text) > 300:
             return resp.text
-    except Exception as e:
+    except requests.RequestException as e:
         print(f"Requests failed for {url}: {e}")
 
     if use_playwright:
-        # Fallback to dynamic approach
-        print("Trying to fetch page with Playwright for dynamic rendering...")
+        print("Trying Playwright for dynamic rendering...")
         return fetch_html_dynamic(url)
 
     return None
 
 
-def parse_api_documentation(url, use_playwright=False):
+def parse_api_documentation(url: str, use_playwright: bool = False) -> Tuple[Optional[str], Optional[str]]:
     """
-    Main function:
-      1. Fetch the documentation HTML (either static or dynamic).
-      2. Detect the doc type (OpenAPI/Swagger/Postman).
-      3. Locate and retrieve the underlying spec (if any).
-      4. Convert it back to the original format.
-
-    Returns a tuple of (doc_type, reconstructed_spec).
+    Main function to parse API documentation.
+    
+    Args:
+        url: Documentation URL
+        use_playwright: Whether to try Playwright for dynamic content
+        
+    Returns:
+        Tuple[Optional[str], Optional[str]]: (doc_type, reconstructed_spec)
     """
-    html_content = fetch_documentation_html(url, use_playwright=use_playwright)
-    if not html_content:
-        print("Could not fetch any HTML content.")
+    if not url:
         return None, None
 
-    # 1. Detect documentation type
-    doc_type = detect_documentation_type(html_content)
-    print(f"Detected documentation type: {doc_type}")
+    html_content = fetch_documentation_html(url, use_playwright)
+    if not html_content:
+        print("Could not fetch HTML content")
+        return None, None
 
-    # 2. Find spec link (try to locate swagger.json, openapi.yaml, or postman_collection.json)
+    # Detect documentation type
+    doc_result = detect_documentation_type(html_content)
+    print(f"Detected documentation type: {doc_result.doc_type} (confidence: {doc_result.confidence:.2f})")
+
+    # Find and fetch spec
     spec_url = find_spec_link(html_content, url)
     if not spec_url:
-        print("No direct spec link found in the HTML.")
-        # Try a JavaScript approach with Playwright (if not already done)
+        print("No spec link found")
         if not use_playwright:
-            print("Re-attempting with Playwright for potential dynamic content...")
+            print("Retrying with Playwright...")
             return parse_api_documentation(url, use_playwright=True)
-        else:
-            return doc_type, None
+        return doc_result.doc_type, None
 
     print(f"Found spec link: {spec_url}")
-
-    # 3. Retrieve the spec
+    
     spec_text = retrieve_api_spec(spec_url)
     if not spec_text:
-        print("Failed to retrieve the spec file.")
-        return doc_type, None
+        return doc_result.doc_type, None
 
-    # 4. Parse the spec into a dictionary
     spec_dict = parse_api_spec(spec_text)
     if not spec_dict:
-        print("Could not parse spec as JSON or YAML.")
-        return doc_type, None
+        return doc_result.doc_type, None
 
-    # 5. Reconstruct it into a canonical format
-    final_definition = reconstruct_definition(spec_dict, doc_type)
-    return doc_type, final_definition
+    final_definition = reconstruct_definition(spec_dict, doc_result.doc_type)
+    return doc_result.doc_type, final_definition
 
 
 if __name__ == "__main__":
-    # Example usage:
-    # You may replace this with any public documentation link you want to test.
     test_url = "https://petstore.swagger.io/"
-
     doc_type, spec = parse_api_documentation(test_url, use_playwright=True)
 
     if doc_type and spec:
