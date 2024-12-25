@@ -333,12 +333,13 @@ def parse_api_documentation(url: str, use_playwright: bool = False) -> List[DocP
 
         # Extract links to other documentation pages
         new_links = extract_doc_links(html_content, current_url)
+        print(f"Found {len(new_links)} new links")
         pages_to_visit.update(new_links - visited_urls)
 
     return parsed_pages
 
 if __name__ == "__main__":
-    test_url = "https://petstore.swagger.io/"
+    test_url = "https://api-docs.quiqup.com/docs/api-documentation/4b402d5ab3edd-welcome-to-the-quiqup-api-docs"
     doc_pages = parse_api_documentation(test_url, use_playwright=True)
 
     print(f"\nFound {len(doc_pages)} documentation pages:")
@@ -346,4 +347,5 @@ if __name__ == "__main__":
         print(f"\nPage: {page.url}")
         print(f"Title: {page.title}")
         if page.spec:
-            print("Found API specification")
+            print("Found API specification\n\n")
+            print(page.spec)
