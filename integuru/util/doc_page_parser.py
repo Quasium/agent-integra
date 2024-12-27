@@ -81,23 +81,37 @@ def extract_doc_links(html_content: str, base_url: str) -> Set[str]:
     links = set()
     base_domain = urlparse(base_url).netloc
 
-    # Common documentation navigation elements
-    nav_elements = soup.find_all(['nav', 'div'], class_=re.compile(r'nav|menu|sidebar|toc', re.IGNORECASE))
+    # First try to find sidebar/menu
+    sidebar = soup.find(['aside', 'div', 'nav'], 
+                       class_=re.compile(r'sidebar|menu|navigation', re.IGNORECASE))
     
-    for nav in nav_elements:
-        for a in nav.find_all('a', href=True):
+    if sidebar:
+        for a in sidebar.find_all('a', href=True):
             url = urljoin(base_url, a['href'])
             if urlparse(url).netloc == base_domain:
                 links.add(url)
+                    
+    # If no links found in sidebar, fall back to searching nav elements and main content
+    if not links:
+        # Common documentation navigation elements
+        nav_elements = soup.find_all(['nav', 'div'])
+        
+        for nav in nav_elements:
+            for a in nav.find_all('a', href=True):
+                url = urljoin(base_url, a['href'])
+                if urlparse(url).netloc == base_domain:
+                    links.add(url)
+                else:
+                    print(f"Skipping link: {url}")
 
-    # Also look for links in main content area
-    main_content = soup.find(['main', 'article', 'div'], 
-                           class_=re.compile(r'content|main|documentation', re.IGNORECASE))
-    if main_content:
-        for a in main_content.find_all('a', href=True):
-            url = urljoin(base_url, a['href'])
-            if urlparse(url).netloc == base_domain:
-                links.add(url)
+        # Also look for links in main content area
+        main_content = soup.find(['main', 'article', 'div'], 
+                               class_=re.compile(r'content|main|documentation', re.IGNORECASE))
+        if main_content:
+            for a in main_content.find_all('a', href=True):
+                url = urljoin(base_url, a['href'])
+                if urlparse(url).netloc == base_domain:
+                    links.add(url)
 
     return links
 
@@ -209,27 +223,45 @@ def reconstruct_definition(spec_dict: Optional[Dict[str, Any]], doc_type: str) -
 
 def fetch_html_dynamic(url: str) -> Optional[str]:
     """
-    Fetch rendered HTML using Playwright.
-    
-    Args:
-        url: URL to fetch
-        
-    Returns:
-        Optional[str]: Rendered HTML if successful, None otherwise
+    Fetch rendered HTML using Playwright with improved timeout handling.
     """
     browser: Optional[Browser] = None
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page: Page = browser.new_page()
-            page.goto(url, wait_until='networkidle', timeout=30000)
-            return page.content()
+            
+            # Try different wait strategies in order
+            try:
+                # First attempt: Wait for DOMContentLoaded with longer timeout
+                page.goto(url, wait_until='domcontentloaded', timeout=60000)
+            except Exception as e:
+                print(f"Initial load failed, trying with load event: {e}")
+                # Second attempt: Wait for load event
+                page.goto(url, wait_until='load', timeout=60000)
+            
+            # Wait additional time for any critical elements if needed
+            try:
+                # Adjust selector based on the specific page structure
+                page.wait_for_selector('main, article, .content, #swagger-ui', timeout=10000)
+            except Exception:
+                # Continue even if specific elements aren't found
+                pass
+            
+            html_content = page.content()
+            browser.close()
+            browser = None
+            return html_content
+            
     except Exception as e:
         print(f"Playwright error when fetching {url}: {e}")
         return None
     finally:
         if browser:
-            browser.close()
+            try:
+                browser.close()
+            except Exception as e:
+                print(f"Error closing browser: {e}")
 
 def fetch_documentation_html(url: str, use_playwright: bool = False) -> Optional[str]:
     """
@@ -237,7 +269,7 @@ def fetch_documentation_html(url: str, use_playwright: bool = False) -> Optional
     
     Args:
         url: URL to fetch
-        use_playwright: Whether to try Playwright if requests fails
+        use_playwright: Whether to try Playwright if no doc pages found
         
     Returns:
         Optional[str]: HTML content if successful, None otherwise
@@ -249,13 +281,19 @@ def fetch_documentation_html(url: str, use_playwright: bool = False) -> Optional
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        if len(resp.text) > 300:
-            return resp.text
+        html_content = resp.text
+        
+        # Check if we can find any documentation links
+        doc_links = extract_doc_links(html_content, url)
+        
+        if doc_links:
+            return html_content
+            
     except requests.RequestException as e:
         print(f"Requests failed for {url}: {e}")
-
+        
     if use_playwright:
-        print("Trying Playwright for dynamic rendering...")
+        print("No documentation links found. Trying Playwright for dynamic rendering...")
         return fetch_html_dynamic(url)
 
     return None
@@ -296,7 +334,9 @@ def parse_doc_page(url: str, html_content: str) -> DocPage:
             
     return DocPage(url=url, title=title, content=content, spec=spec)
 
-def parse_api_documentation(url: str, use_playwright: bool = False) -> List[DocPage]:
+def parse_api_documentation(url: str, use_playwright
+                            
+                            : bool = False) -> List[DocPage]:
     """
     Main function to parse API documentation by crawling all pages.
     
@@ -336,16 +376,19 @@ def parse_api_documentation(url: str, use_playwright: bool = False) -> List[DocP
         print(f"Found {len(new_links)} new links")
         pages_to_visit.update(new_links - visited_urls)
 
+    print(f"visited_urls: {visited_urls}")
     return parsed_pages
 
 if __name__ == "__main__":
-    test_url = "https://api-docs.quiqup.com/docs/api-documentation/4b402d5ab3edd-welcome-to-the-quiqup-api-docs"
+    test_url = "https://api-docs.quiqup.com/docs/api-documentation/d5c50ad25bbc8-ecommerce-api"
     doc_pages = parse_api_documentation(test_url, use_playwright=True)
 
     print(f"\nFound {len(doc_pages)} documentation pages:")
     for page in doc_pages:
-        print(f"\nPage: {page.url}")
-        print(f"Title: {page.title}")
+        # print(f"\nPage: {page.url}")
+        # print(f"Title: {page.title}")
         if page.spec:
             print("Found API specification\n\n")
             print(page.spec)
+        else:
+            print("No API specification found")
